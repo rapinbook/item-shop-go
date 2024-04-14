@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -45,9 +48,35 @@ func (s *echoServer) Start() {
 	s.app.Use(stat.Process)
 	// Server header
 	s.app.Use(ServerHeader)
+	// Middleware
+	s.app.Use(middleware.Logger())
+	// Prevent application from crashing
+	s.app.Use(middleware.Recover())
+	// CORS
+	s.app.Use(getCORSMiddleware(s.conf.Server.AllowOrigins))
+	s.app.Use(getTimeOutMiddleware(time.Duration(s.conf.Server.Timeout)))
+	s.app.Use(getBodyLimitMiddleware(s.conf.Server.BodyLimit))
+
 	s.app.GET("/v1/health", s.healthCheck)
 	s.app.GET("/v1/stats", stat.Handle) // Endpoint to get stats
-	s.httpListening()
+	// More modern way of shutting down without determine the type of signal
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	// Start server
+	go s.httpListening()
+
+	// Wait for interrupt signal to gracefully shutdown the server with a timeout of 10 seconds.
+	<-ctx.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fmt.Println("Waiting for ongoing work to finish...")
+	time.Sleep(time.Second * 2) // Adjust this timeout based on your task
+	s.app.Logger.Infof("Shutting down service...")
+	time.Sleep(time.Second * 8) // Adjust this timeout based on your task
+	fmt.Println("Server stopped")
+	if err := s.app.Shutdown(ctx); err != nil {
+		s.app.Logger.Fatal(err)
+	}
 }
 
 func (s *echoServer) httpListening() {
