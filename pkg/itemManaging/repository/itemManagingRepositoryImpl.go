@@ -43,3 +43,14 @@ func (r *itemManagingRepositoryImpl) Editing(itemID uint64, itemEditingReq *_ite
 
 	return itemID, nil
 }
+
+func (r *itemManagingRepositoryImpl) Archiving(itemID uint64) error {
+	item := new(entities.Item)
+	err := r.db.Connect().First(&item, "id = ?", itemID).Update("IsArchive", true).Error
+	if err != nil {
+		r.logger.Errorf("Cannot Update item from table")
+		return err
+	}
+
+	return nil
+}
