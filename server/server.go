@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,7 +16,42 @@ import (
 	"github.com/labstack/gommon/log"
 	"github.com/rapinbook/item-shop-go/config"
 	"github.com/rapinbook/item-shop-go/databases"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
+
+const (
+	charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+
+var (
+	playerOauthConfig *oauth2.Config
+	adminOauthConfig  *oauth2.Config
+)
+
+type User struct {
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	// Add other relevant user details obtained from Google
+}
+
+func init() {
+	conf := config.ConfigGetting()
+	playerOauthConfig = &oauth2.Config{
+		RedirectURL:  conf.OAuth2.PlayerRedirectUrl,
+		ClientID:     conf.OAuth2.ClientId,
+		ClientSecret: conf.OAuth2.ClientSecret,
+		Scopes:       conf.OAuth2.Scopes,
+		Endpoint:     google.Endpoint,
+	}
+	adminOauthConfig = &oauth2.Config{
+		RedirectURL:  conf.OAuth2.PlayerRedirectUrl,
+		ClientID:     conf.OAuth2.ClientId,
+		ClientSecret: conf.OAuth2.ClientSecret,
+		Scopes:       conf.OAuth2.Scopes,
+		Endpoint:     google.Endpoint,
+	}
+}
 
 type echoServer struct {
 	app  *echo.Echo
@@ -59,6 +96,9 @@ func (s *echoServer) Start() {
 
 	s.app.GET("/v1/health", s.healthCheck)
 	s.app.GET("/v1/stats", stat.Handle) // Endpoint to get stats
+	s.app.GET("/v1/oauth2/google/player/login", loginHandler)
+	s.app.GET("/v1/oauth2/google/player/login/callback", callbackHandler)
+	s.app.GET("/v1/oauth2/google/player/logout", logoutHandler)
 	// More modern way of shutting down without determine the type of signal
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -72,7 +112,7 @@ func (s *echoServer) Start() {
 	fmt.Println("Waiting for ongoing work to finish...")
 	time.Sleep(time.Second * 2) // Adjust this timeout based on your task
 	s.app.Logger.Infof("Shutting down service...")
-	time.Sleep(time.Second * 8) // Adjust this timeout based on your task
+	time.Sleep(time.Second * 2) // Adjust this timeout based on your task
 	fmt.Println("Server stopped")
 	if err := s.app.Shutdown(ctx); err != nil {
 		s.app.Logger.Fatal(err)
@@ -110,4 +150,87 @@ func getCORSMiddleware(allowOrigins []string) echo.MiddlewareFunc {
 
 func getBodyLimitMiddleware(bodyLimit string) echo.MiddlewareFunc {
 	return middleware.BodyLimit(bodyLimit)
+}
+
+func generateRandomString(length int) string {
+	var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[seededRand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func loginHandler(c echo.Context) error {
+	state := generateRandomString(32)
+	authURL := playerOauthConfig.AuthCodeURL(state)
+	c.SetCookie(&http.Cookie{
+		Name:     "oauthstate",
+		Value:    state,
+		HttpOnly: true,
+		Expires:  time.Now().AddDate(0, 0, 20),
+
+		// Set other cookie attributes (secure, HttpOnly, etc.)
+	})
+	return c.Redirect(http.StatusFound, authURL)
+}
+
+func callbackHandler(c echo.Context) error {
+	state := c.QueryParam("state")
+	cookieState, err := c.Request().Cookie("oauthstate")
+	if err != nil || state != cookieState.Value {
+		return c.String(http.StatusForbidden, "Invalid state parameter")
+	}
+
+	code := c.QueryParam("code")
+	ctx := context.Background()
+
+	token, err := playerOauthConfig.Exchange(ctx, code)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to exchange code for token")
+	}
+
+	// Use the access token to retrieve user information
+	client := oauth2.NewClient(ctx, playerOauthConfig.TokenSource(ctx, token))
+	userInfo, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to retrieve user information")
+	}
+
+	defer userInfo.Body.Close()
+	var user User
+	err = json.NewDecoder(userInfo.Body).Decode(&user)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to decode user information")
+	}
+	c.SetCookie(&http.Cookie{
+		Name:    "oauthstate",
+		Value:   "true",
+		MaxAge:  -1,
+		Path:    "/",
+		Expires: time.Now(),
+		// Set other cookie attributes (secure, HttpOnly, etc.)
+	})
+
+	return c.String(http.StatusOK, fmt.Sprintf("Login successful for user: %s (Email: %s)", user.Name, user.Email))
+}
+
+func logoutHandler(c echo.Context) error {
+	// Clear access token from client-side storage (e.g., localStorage)
+	// You'll need to inject JavaScript code to achieve this
+	// ... (client-side script injection)
+
+	// Optionally, set a "loggedOut" cookie to indicate logout on server-side
+
+	cookie, _ := c.Cookie("oauthstate")
+
+	cookie = &http.Cookie{
+		Name:    "oauthstate",
+		Path:    "/",
+		Expires: time.Now(),
+		Value:   "",
+		MaxAge:  -1,
+	}
+	c.SetCookie(cookie)
+	return c.String(http.StatusFound, fmt.Sprintf("Logout successfully %v", cookie.Expires)) // Redirect to login page
 }
